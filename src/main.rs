@@ -4,16 +4,17 @@ use dotenv::dotenv;
 use reqwest::header::{AUTHORIZATION, USER_AGENT};
 use serde::Deserialize;
 use serde_json::json;
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::{collections::HashSet, env, time::Duration};
 use tokio::time::sleep;
 
 #[derive(Debug, Deserialize)]
 struct SearchResponse {
-    items: Vec<Issue>,
+    items: Vec<SearchItem>,
 }
 
 #[derive(Debug, Deserialize)]
-struct Issue {
+struct SearchItem {
     repository_url: String,
 }
 
@@ -21,18 +22,18 @@ struct Issue {
 async fn main() -> Result<()> {
     dotenv().ok();
     let token = env::var("GITHUB_TOKEN").expect("GITHUB_TOKEN must be set");
-    let client = reqwest::Client::new();
+    let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
-    // Added all requested languages
-    let languages = vec![
-        "Python", 
-        "Go", 
-        "Rust", 
-        "JavaScript", 
-        "TypeScript", 
-        "Java", 
-        "cpp" // GitHub uses "cpp" for C++ in search queries
-    ];
+    println!("🔌 Connecting to Supabase...");
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .context("Failed to connect to database. Check your DATABASE_URL.")?;
+    println!("✅ Database connected.");
+
+    let client = reqwest::Client::new();
+    let languages = vec!["Python", "Go", "Rust", "JavaScript", "TypeScript", "Java", "cpp"];
 
     for language in languages {
         println!("\n========================================================");
@@ -43,7 +44,6 @@ async fn main() -> Result<()> {
         let mut valid_repos_found = 0;
         let mut page = 1;
 
-        // Keep paginating until we find exactly 20 high-quality repos
         while valid_repos_found < 20 {
             let query = format!(
                 "https://api.github.com/search/issues?q=is:issue is:open label:\"good first issue\" language:{}&per_page=30&page={}",
@@ -57,25 +57,19 @@ async fn main() -> Result<()> {
                 .send()
                 .await?;
 
-            let data: SearchResponse = response.json().await?;
+            let data: SearchResponse = response.json().await.unwrap_or(SearchResponse { items: vec![] });
 
-            // Break the loop if GitHub runs out of search results
             if data.items.is_empty() {
                 println!("⚠️ No more results found for {} on page {}.", language, page);
-                break; 
+                break;
             }
 
-            for issue in data.items {
+            for item in data.items {
                 if valid_repos_found >= 20 {
-                    break; // Stop exactly at 20
+                    break;
                 }
 
-                let repo_full_name = issue
-                    .repository_url
-                    .split("/repos/")
-                    .nth(1)
-                    .unwrap_or("")
-                    .to_string();
+                let repo_full_name = item.repository_url.split("/repos/").nth(1).unwrap_or("").to_string();
 
                 if unique_repos.contains(&repo_full_name) || repo_full_name.is_empty() {
                     continue;
@@ -83,30 +77,29 @@ async fn main() -> Result<()> {
                 unique_repos.insert(repo_full_name.clone());
 
                 let parts: Vec<&str> = repo_full_name.split('/').collect();
-                if parts.len() != 2 {
-                    continue;
-                }
+                if parts.len() != 2 { continue; }
                 let owner = parts[0];
                 let name = parts[1];
 
-                // Added the clickable GitHub URL here
-                println!("\n📦 Repo: {}/{} | 🔗 https://github.com/{}/{}", owner, name, owner, name);
+                println!("\n📦 Processing: {}/{} | 🔗 https://github.com/{}", owner, name, repo_full_name);
 
                 match fetch_graphql_data(&client, &token, owner, name).await {
                     Ok(repo_data) => {
-                        // We check if process_and_print_repo returns true (meaning it passed our quality filters)
-                        if process_and_print_repo(&repo_data) {
-                            valid_repos_found += 1;
-                            println!("✅ [{}/20] Valid {} repos collected", valid_repos_found, language);
+                        match process_and_save_repo(&pool, &repo_data, owner, name, language, &repo_full_name).await {
+                            Ok(true) => {
+                                valid_repos_found += 1;
+                                println!("✅ [{}/20] Saved {} to Supabase", valid_repos_found, language);
+                            }
+                            Ok(false) => { /* Skipped due to filters */ }
+                            Err(e) => println!("❌ Database Error: {}", e),
                         }
                     }
-                    Err(e) => println!("⚠️ Failed to fetch data for {}: {}", repo_full_name, e),
+                    Err(e) => println!("⚠️ GraphQL Fetch Failed: {}", e),
                 }
 
-                sleep(Duration::from_millis(500)).await;
+                sleep(Duration::from_millis(500)).await; // Polite API delay
             }
-            
-            page += 1; // Go to the next page of search results if we haven't hit 20 yet
+            page += 1;
         }
     }
 
@@ -131,13 +124,14 @@ async fn fetch_graphql_data(
         pushedAt
         issues(states: OPEN) { totalCount }
         defaultBranchRef {
-          target {
-            ... on Commit { history(since: $since) { totalCount } }
-          }
+          target { ... on Commit { history(since: $since) { totalCount } } }
         }
-        recentIssues: issues(last: 30) {
+        recentIssues: issues(last: 30, states: OPEN) {
           nodes {
+            title
+            url
             createdAt
+            labels(first: 5) { nodes { name } }
             comments(first: 1) { nodes { createdAt } }
           }
         }
@@ -157,11 +151,7 @@ async fn fetch_graphql_data(
 
     let payload = json!({
         "query": query,
-        "variables": {
-            "owner": owner,
-            "name": name,
-            "since": since
-        }
+        "variables": { "owner": owner, "name": name, "since": since }
     });
 
     let res: serde_json::Value = client
@@ -181,29 +171,33 @@ async fn fetch_graphql_data(
     Ok(res["data"]["repository"].clone())
 }
 
-// ================= DATA PROCESSING =================
+// ================= DATA PROCESSING & DB INSERT =================
 
-// Now returns a boolean: true if it's a good repo, false if it got skipped
-fn process_and_print_repo(repo: &serde_json::Value) -> bool {
-    if repo.is_null() {
-        return false;
-    }
+async fn process_and_save_repo(
+    pool: &PgPool,
+    repo: &serde_json::Value,
+    _owner: &str,
+    name: &str,
+    language: &str,
+    full_name: &str,
+) -> Result<bool> {
+    if repo.is_null() { return Ok(false); }
 
-    let stars = repo["stargazerCount"].as_u64().unwrap_or(0);
-    
-    // 🔥 FILTER: Skip dead or unloved repos immediately
+    let stars = repo["stargazerCount"].as_i64().unwrap_or(0);
     if stars < 10 {
         println!("   ⏭️ Skipping: Too few stars ({})", stars);
-        return false;
+        return Ok(false);
     }
 
-    let forks = repo["forkCount"].as_u64().unwrap_or(0);
-    let open_issues = repo["issues"]["totalCount"].as_u64().unwrap_or(0);
-    let commits_30d = repo["defaultBranchRef"]["target"]["history"]["totalCount"].as_u64().unwrap_or(0);
+    let forks = repo["forkCount"].as_i64().unwrap_or(0);
+    let commits_30d = repo["defaultBranchRef"]["target"]["history"]["totalCount"].as_i64().unwrap_or(0);
+    
+    let pushed_at_str = repo["pushedAt"].as_str().unwrap_or("");
+    let last_active = DateTime::parse_from_rfc3339(pushed_at_str)
+        .unwrap_or_else(|_| Utc::now().into())
+        .with_timezone(&Utc);
 
-    println!("⭐ Stars: {} | 🍴 Forks: {} | 📂 Open Issues: {}", stars, forks, open_issues);
-    println!("📊 30d Commits: {}", commits_30d);
-
+    // --- Calculate Metrics ---
     let mut response_total_hrs = 0.0;
     let mut response_count = 0;
 
@@ -215,12 +209,11 @@ fn process_and_print_repo(repo: &serde_json::Value) -> bool {
             ) {
                 if let Some(first_comment) = comments.first() {
                     if let Some(comment_created_str) = first_comment["createdAt"].as_str() {
-                        if let (Ok(created), Ok(commented)) = (
+                        if let (Ok(c), Ok(cm)) = (
                             DateTime::parse_from_rfc3339(created_str),
                             DateTime::parse_from_rfc3339(comment_created_str),
                         ) {
-                            let duration = commented.with_timezone(&Utc) - created.with_timezone(&Utc);
-                            response_total_hrs += duration.num_hours() as f64;
+                            response_total_hrs += (cm - c).num_hours() as f64;
                             response_count += 1;
                         }
                     }
@@ -228,9 +221,7 @@ fn process_and_print_repo(repo: &serde_json::Value) -> bool {
             }
         }
     }
-    
-    let avg_response = if response_count > 0 { response_total_hrs / response_count as f64 } else { 0.0 };
-    println!("⏱ Avg Issue Response (hrs): {:.1}", avg_response);
+    let response_time_avg = if response_count > 0 { response_total_hrs / response_count as f64 } else { 0.0 };
 
     let mut merge_total_hrs = 0.0;
     let mut total_lines = 0.0;
@@ -240,53 +231,109 @@ fn process_and_print_repo(repo: &serde_json::Value) -> bool {
 
     if let Some(prs) = repo["recentPRs"]["nodes"].as_array() {
         for pr in prs {
-            if let (Some(created_str), Some(merged_str)) = (
-                pr["createdAt"].as_str(),
-                pr["mergedAt"].as_str(),
-            ) {
-                if let (Ok(created), Ok(merged)) = (
+            if let (Some(created_str), Some(merged_str)) = (pr["createdAt"].as_str(), pr["mergedAt"].as_str()) {
+                if let (Ok(c), Ok(m)) = (
                     DateTime::parse_from_rfc3339(created_str),
                     DateTime::parse_from_rfc3339(merged_str),
                 ) {
-                    let duration = merged.with_timezone(&Utc) - created.with_timezone(&Utc);
-                    merge_total_hrs += duration.num_hours() as f64;
-                    
+                    merge_total_hrs += (m - c).num_hours() as f64;
                     total_lines += pr["additions"].as_f64().unwrap_or(0.0) + pr["deletions"].as_f64().unwrap_or(0.0);
                     total_files += pr["changedFiles"].as_f64().unwrap_or(0.0);
                     total_comments += pr["totalCommentsCount"].as_f64().unwrap_or(0.0);
-                    
                     pr_count += 1.0;
                 }
             }
         }
     }
 
-    if pr_count > 0.0 {
-        let avg_merge = merge_total_hrs / pr_count;
-        println!("🔀 Avg PR Merge Time (hrs): {:.1}", avg_merge);
+    let mut pr_merge_avg = 0.0;
+    let mut normalized_difficulty: Option<f64> = None;
 
+    if pr_count > 0.0 {
+        pr_merge_avg = merge_total_hrs / pr_count;
         let avg_lines = total_lines / pr_count;
         let avg_files = total_files / pr_count;
         let avg_comments = total_comments / pr_count;
-        let avg_days = avg_merge / 24.0;
+        let avg_days = pr_merge_avg / 24.0;
 
         let scaled_lines = (avg_lines + 1.0).ln();
         let scaled_files = (avg_files + 1.0).ln();
         let scaled_comments = (avg_comments + 1.0).ln();
         let scaled_days = (avg_days + 1.0).ln();
 
-        let raw_score = (scaled_lines * 0.4) 
-                      + (scaled_files * 0.3) 
-                      + (scaled_comments * 0.2) 
-                      + (scaled_days * 0.1);
-
-        let normalized_score = raw_score * 10.0; 
-        
-        println!("🧠 Normalized Difficulty Score: {:.2}", normalized_score);
-    } else {
-        println!("🔀 Avg PR Merge Time: N/A");
-        println!("🧠 Normalized Difficulty Score: N/A");
+        let raw_score = (scaled_lines * 0.4) + (scaled_files * 0.3) + (scaled_comments * 0.2) + (scaled_days * 0.1);
+        normalized_difficulty = Some(raw_score * 10.0);
     }
 
-    true // Repository passed filters and was processed successfully
+    let health_score = normalized_difficulty.map(|d| 100.0 - d).unwrap_or(50.0);
+
+    let health_json = json!({
+        "commits_30d": commits_30d,
+        "response_time_avg": response_time_avg,
+        "pr_merge_avg": pr_merge_avg
+    });
+
+    // --- 1. UPSERT Repository (NO MACRO BANG!) ---
+    sqlx::query(
+        r#"
+        INSERT INTO repos (full_name, name, stars, forks, health_score, language, last_active, health_json)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (full_name) DO UPDATE 
+        SET stars = EXCLUDED.stars, forks = EXCLUDED.forks, health_score = EXCLUDED.health_score, 
+            last_active = EXCLUDED.last_active, health_json = EXCLUDED.health_json
+        "#
+    )
+    .bind(full_name)
+    .bind(name)
+    .bind(stars as i32)
+    .bind(forks as i32)
+    .bind(health_score)
+    .bind(language)
+    .bind(last_active)
+    .bind(&health_json)
+    .execute(pool)
+    .await?;
+
+    // --- 2. UPSERT Issues (NO MACRO BANG!) ---
+    if let Some(issues) = repo["recentIssues"]["nodes"].as_array() {
+        for issue in issues {
+            let title = issue["title"].as_str().unwrap_or("Untitled");
+            let url = issue["url"].as_str().unwrap_or("");
+            if url.is_empty() { continue; }
+
+            let created_str = issue["createdAt"].as_str().unwrap_or("");
+            let created_at = DateTime::parse_from_rfc3339(created_str)
+                .unwrap_or_else(|_| Utc::now().into())
+                .with_timezone(&Utc);
+
+            let mut label_names = Vec::new();
+            if let Some(labels_array) = issue["labels"]["nodes"].as_array() {
+                for label in labels_array {
+                    if let Some(label_name) = label["name"].as_str() {
+                        label_names.push(label_name.to_string());
+                    }
+                }
+            }
+            let labels_json = json!(label_names);
+
+            sqlx::query(
+                r#"
+                INSERT INTO issues (url, repo_id, title, difficulty_score, labels, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (url) DO UPDATE 
+                SET title = EXCLUDED.title, difficulty_score = EXCLUDED.difficulty_score, labels = EXCLUDED.labels
+                "#
+            )
+            .bind(url)
+            .bind(full_name)
+            .bind(title)
+            .bind(normalized_difficulty)
+            .bind(&labels_json)
+            .bind(created_at)
+            .execute(pool)
+            .await?;
+        }
+    }
+
+    Ok(true)
 }
