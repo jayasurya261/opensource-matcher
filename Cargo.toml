@@ -1,0 +1,27 @@
+[package]
+name = "github-scraper"
+version = "0.1.0"
+edition = "2024"
+
+
+[dependencies]
+# Error handling
+anyhow = "1.0"
+
+# Date and time manipulation for calculating merge/response times
+chrono = "0.4"
+
+# Environment variable management for your GITHUB_TOKEN
+dotenv = "0.15"
+
+# HTTP client with JSON support enabled
+reqwest = { version = "0.12", features = ["json"] }
+
+# Serialization/Deserialization framework
+serde = { version = "1.0", features = ["derive"] }
+
+# JSON manipulation and the json! macro for the GraphQL payload
+serde_json = "1.0"
+
+# Async runtime
+tokio = { version = "1.36", features = ["full"] }
