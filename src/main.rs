@@ -23,59 +23,90 @@ async fn main() -> Result<()> {
     let token = env::var("GITHUB_TOKEN").expect("GITHUB_TOKEN must be set");
     let client = reqwest::Client::new();
 
-    let languages = vec!["Python", "Rust", "Go"]; // Shortened for testing
+    // Added all requested languages
+    let languages = vec![
+        "Python", 
+        "Go", 
+        "Rust", 
+        "JavaScript", 
+        "TypeScript", 
+        "Java", 
+        "cpp" // GitHub uses "cpp" for C++ in search queries
+    ];
 
     for language in languages {
-        println!("\n==============================");
-        println!("🚀 LANGUAGE: {}", language);
-        println!("==============================");
+        println!("\n========================================================");
+        println!("🚀 LANGUAGE: {}", language.to_uppercase());
+        println!("========================================================");
 
-        // 1. Find Repositories using REST Search (Still the best way to discover repos)
-        let query = format!(
-            "https://api.github.com/search/issues?q=is:issue is:open label:\"good first issue\" language:{}&per_page=20&page=1",
-            language
-        );
-
-        let response = client
-            .get(&query)
-            .header(USER_AGENT, "rust-github-scraper")
-            .header(AUTHORIZATION, format!("Bearer {}", token))
-            .send()
-            .await?;
-
-        let data: SearchResponse = response.json().await?;
         let mut unique_repos = HashSet::new();
+        let mut valid_repos_found = 0;
+        let mut page = 1;
 
-        for issue in data.items {
-            let repo_full_name = issue
-                .repository_url
-                .split("/repos/")
-                .nth(1)
-                .unwrap_or("")
-                .to_string();
+        // Keep paginating until we find exactly 20 high-quality repos
+        while valid_repos_found < 20 {
+            let query = format!(
+                "https://api.github.com/search/issues?q=is:issue is:open label:\"good first issue\" language:{}&per_page=30&page={}",
+                language, page
+            );
 
-            if unique_repos.contains(&repo_full_name) || repo_full_name.is_empty() {
-                continue;
-            }
-            unique_repos.insert(repo_full_name.clone());
+            let response = client
+                .get(&query)
+                .header(USER_AGENT, "rust-github-scraper")
+                .header(AUTHORIZATION, format!("Bearer {}", token))
+                .send()
+                .await?;
 
-            let parts: Vec<&str> = repo_full_name.split('/').collect();
-            if parts.len() != 2 {
-                continue;
-            }
-            let owner = parts[0];
-            let name = parts[1];
+            let data: SearchResponse = response.json().await?;
 
-            println!("\n📦 Repo: {}/{}", owner, name);
-
-            // 2. Fetch EVERYTHING else in ONE GraphQL call
-            match fetch_graphql_data(&client, &token, owner, name).await {
-                Ok(repo_data) => process_and_print_repo(repo_data),
-                Err(e) => println!("⚠️ Failed to fetch data for {}: {}", repo_full_name, e),
+            // Break the loop if GitHub runs out of search results
+            if data.items.is_empty() {
+                println!("⚠️ No more results found for {} on page {}.", language, page);
+                break; 
             }
 
-            // Sleep slightly to be polite to the GraphQL endpoint
-            sleep(Duration::from_millis(500)).await;
+            for issue in data.items {
+                if valid_repos_found >= 20 {
+                    break; // Stop exactly at 20
+                }
+
+                let repo_full_name = issue
+                    .repository_url
+                    .split("/repos/")
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+
+                if unique_repos.contains(&repo_full_name) || repo_full_name.is_empty() {
+                    continue;
+                }
+                unique_repos.insert(repo_full_name.clone());
+
+                let parts: Vec<&str> = repo_full_name.split('/').collect();
+                if parts.len() != 2 {
+                    continue;
+                }
+                let owner = parts[0];
+                let name = parts[1];
+
+                // Added the clickable GitHub URL here
+                println!("\n📦 Repo: {}/{} | 🔗 https://github.com/{}/{}", owner, name, owner, name);
+
+                match fetch_graphql_data(&client, &token, owner, name).await {
+                    Ok(repo_data) => {
+                        // We check if process_and_print_repo returns true (meaning it passed our quality filters)
+                        if process_and_print_repo(&repo_data) {
+                            valid_repos_found += 1;
+                            println!("✅ [{}/20] Valid {} repos collected", valid_repos_found, language);
+                        }
+                    }
+                    Err(e) => println!("⚠️ Failed to fetch data for {}: {}", repo_full_name, e),
+                }
+
+                sleep(Duration::from_millis(500)).await;
+            }
+            
+            page += 1; // Go to the next page of search results if we haven't hit 20 yet
         }
     }
 
@@ -92,7 +123,6 @@ async fn fetch_graphql_data(
 ) -> Result<serde_json::Value> {
     let since = (Utc::now() - ChronoDuration::days(30)).to_rfc3339();
 
-    // The Ultimate GraphQL Query: Gets basic info, commits, issues, and PRs in one shot
     let query = r#"
     query($owner: String!, $name: String!, $since: GitTimestamp!) {
       repository(owner: $owner, name: $name) {
@@ -153,28 +183,27 @@ async fn fetch_graphql_data(
 
 // ================= DATA PROCESSING =================
 
-fn process_and_print_repo(repo: serde_json::Value) {
+// Now returns a boolean: true if it's a good repo, false if it got skipped
+fn process_and_print_repo(repo: &serde_json::Value) -> bool {
     if repo.is_null() {
-        return;
+        return false;
     }
 
-    // --- 1. Basic Filters & Info ---
     let stars = repo["stargazerCount"].as_u64().unwrap_or(0);
-    let forks = repo["forkCount"].as_u64().unwrap_or(0);
     
     // 🔥 FILTER: Skip dead or unloved repos immediately
     if stars < 10 {
         println!("   ⏭️ Skipping: Too few stars ({})", stars);
-        return;
+        return false;
     }
 
+    let forks = repo["forkCount"].as_u64().unwrap_or(0);
     let open_issues = repo["issues"]["totalCount"].as_u64().unwrap_or(0);
     let commits_30d = repo["defaultBranchRef"]["target"]["history"]["totalCount"].as_u64().unwrap_or(0);
 
     println!("⭐ Stars: {} | 🍴 Forks: {} | 📂 Open Issues: {}", stars, forks, open_issues);
     println!("📊 30d Commits: {}", commits_30d);
 
-    // --- 2. Avg Issue Response Time ---
     let mut response_total_hrs = 0.0;
     let mut response_count = 0;
 
@@ -203,7 +232,6 @@ fn process_and_print_repo(repo: serde_json::Value) {
     let avg_response = if response_count > 0 { response_total_hrs / response_count as f64 } else { 0.0 };
     println!("⏱ Avg Issue Response (hrs): {:.1}", avg_response);
 
-    // --- 3. PR Merge Time & Normalized Difficulty ---
     let mut merge_total_hrs = 0.0;
     let mut total_lines = 0.0;
     let mut total_files = 0.0;
@@ -242,7 +270,6 @@ fn process_and_print_repo(repo: serde_json::Value) {
         let avg_comments = total_comments / pr_count;
         let avg_days = avg_merge / 24.0;
 
-        // 🔥 NORMALIZED DIFFICULTY MATH
         let scaled_lines = (avg_lines + 1.0).ln();
         let scaled_files = (avg_files + 1.0).ln();
         let scaled_comments = (avg_comments + 1.0).ln();
@@ -253,11 +280,13 @@ fn process_and_print_repo(repo: serde_json::Value) {
                       + (scaled_comments * 0.2) 
                       + (scaled_days * 0.1);
 
-        let normalized_score = raw_score * 10.0; // Scales it to roughly 0-100
+        let normalized_score = raw_score * 10.0; 
         
         println!("🧠 Normalized Difficulty Score: {:.2}", normalized_score);
     } else {
         println!("🔀 Avg PR Merge Time: N/A");
         println!("🧠 Normalized Difficulty Score: N/A");
     }
+
+    true // Repository passed filters and was processed successfully
 }
