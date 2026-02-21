@@ -25,16 +25,23 @@ async fn main() -> Result<()> {
     let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     println!("🔌 Connecting to Supabase...");
+    
+    // PRODUCTION OPTIMIZATION: Tuned Connection Pool for long-running servers
     let pool = PgPoolOptions::new()
         .max_connections(5)
+        .min_connections(1) // Keep at least 1 alive
+        .idle_timeout(Duration::from_secs(300)) // Prevent Supabase from dropping stale connections
         .connect(&db_url)
         .await
         .context("Failed to connect to database. Check your DATABASE_URL.")?;
+        
     println!("✅ Database connected. Starting hourly scraper server...");
 
-    let client = reqwest::Client::new();
+    // PRODUCTION OPTIMIZATION: HTTP Client Timeouts to prevent indefinite hangs
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(45))
+        .build()?;
     
-    // Updated Language List
     let languages = vec![
         "Rust", "JavaScript", "TypeScript", "Java", "cpp", "Python", "Go", "c", "php"
     ];
@@ -73,7 +80,14 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                let data: SearchResponse = response.json().await.unwrap_or(SearchResponse { items: vec![] });
+                // PRODUCTION OPTIMIZATION: Safe JSON parsing
+                let data: SearchResponse = match response.json().await {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        println!("⚠️ Failed to parse JSON from GitHub API: {}", e);
+                        break;
+                    }
+                };
 
                 if data.items.is_empty() {
                     println!("⚠️ No more results found for {} on page {}.", language, page);
@@ -111,13 +125,13 @@ async fn main() -> Result<()> {
                         Err(e) => println!("⚠️ GraphQL Fetch Failed: {}", e),
                     }
 
-                    sleep(Duration::from_millis(500)).await; // Polite API delay to prevent rate limiting
+                    sleep(Duration::from_millis(500)).await; // Polite API delay
                 }
                 page += 1;
             }
         }
 
-        // Run database cleanup after scraping all languages
+        // Run database cleanup
         if let Err(e) = cleanup_database(&pool).await {
             println!("❌ Failed to cleanup database: {}", e);
         }
@@ -125,7 +139,7 @@ async fn main() -> Result<()> {
         let next_run = Local::now() + ChronoDuration::hours(1);
         println!("\n💤 Scrape cycle complete. Sleeping until {}...", next_run.format("%Y-%m-%d %H:%M:%S"));
         
-        // Sleep for exactly 1 hour (3600 seconds)
+        // Sleep for exactly 1 hour
         sleep(Duration::from_secs(3600)).await;
     }
 }
@@ -135,7 +149,9 @@ async fn main() -> Result<()> {
 async fn cleanup_database(pool: &PgPool) -> Result<()> {
     println!("\n🧹 Enforcing database limits...");
 
-    // 1. Enforce Max 2000 Issues
+    // PRODUCTION OPTIMIZATION: Use Transactions for safe, atomic deletions
+    let mut tx = pool.begin().await?;
+
     let issues_deleted = sqlx::query(
         r#"
         DELETE FROM issues 
@@ -146,12 +162,10 @@ async fn cleanup_database(pool: &PgPool) -> Result<()> {
         )
         "#
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     println!("   🗑️ Pruned {} old issues (Max 2000 limit).", issues_deleted.rows_affected());
 
-    // 2. Enforce Max 200 Repositories
-    // We select the repos to delete, then delete their issues first to avoid Foreign Key conflicts
     let repos_to_delete: Vec<(String,)> = sqlx::query_as(
         r#"
         SELECT full_name FROM repos 
@@ -159,27 +173,29 @@ async fn cleanup_database(pool: &PgPool) -> Result<()> {
         OFFSET 200
         "#
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
 
     let mut repos_deleted_count = 0;
     
     for repo in repos_to_delete {
         let repo_id = repo.0;
-        // Safely cascade delete orphaned issues tied to this repo
+        
         sqlx::query("DELETE FROM issues WHERE repo_id = $1")
             .bind(&repo_id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
 
-        // Delete the repo
         sqlx::query("DELETE FROM repos WHERE full_name = $1")
             .bind(&repo_id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
             
         repos_deleted_count += 1;
     }
+    
+    // Commit the transaction - if anything failed above, NO data is deleted
+    tx.commit().await?;
     
     println!("   🗑️ Pruned {} old repos (Max 200 limit).", repos_deleted_count);
     
@@ -425,6 +441,10 @@ async fn process_and_save_repo(
         "src_extensions": ext_counts
     });
 
+    // PRODUCTION OPTIMIZATION: Use Transactions for batched database operations
+    // This dramatically increases write speed and guarantees ACID safety.
+    let mut tx = pool.begin().await?;
+
     sqlx::query(
         r#"
         INSERT INTO repos (full_name, name, stars, forks, health_score, language, last_active, health_json)
@@ -442,7 +462,7 @@ async fn process_and_save_repo(
     .bind(language)
     .bind(last_active)
     .bind(&health_json)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     for issue in valid_issues_to_insert {
@@ -487,9 +507,12 @@ async fn process_and_save_repo(
         .bind(normalized_difficulty)
         .bind(&labels_json)
         .bind(created_at)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
+
+    // Commit all changes for this repository together
+    tx.commit().await?;
 
     Ok(true)
 }
