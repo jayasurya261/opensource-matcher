@@ -18,6 +18,18 @@ struct SearchItem {
     repository_url: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct GithubIssue {
+    number: i64,
+    pull_request: Option<serde_json::Value>,
+}
+
+#[derive(sqlx::FromRow)]
+struct DbIssueRow {
+    url: String,
+    repo_id: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
@@ -41,6 +53,27 @@ async fn main() -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(45))
         .build()?;
+        
+    // Spawn background sync task
+    let sync_pool = pool.clone();
+    let sync_client = client.clone();
+    let sync_token = token.clone();
+    tokio::spawn(async move {
+        loop {
+            let now = Local::now();
+            println!("\n========================================================");
+            println!("🕒 [Sync Task] STARTING STATE SYNC: {}", now.format("%Y-%m-%d %H:%M:%S"));
+            println!("========================================================");
+            
+            if let Err(e) = sync_open_issues(&sync_pool, &sync_client, &sync_token).await {
+                println!("❌ [Sync Task] Failed: {}", e);
+            }
+            
+            let next_run = Local::now() + ChronoDuration::hours(1);
+            println!("\n💤 [Sync Task] Sync complete. Sleeping until {}...", next_run.format("%Y-%m-%d %H:%M:%S"));
+            sleep(Duration::from_secs(3600)).await;
+        }
+    });
     
     let languages = vec![
         "Rust", "JavaScript", "TypeScript", "Java", "cpp", "Python", "Go", "c", "php"
@@ -490,10 +523,10 @@ async fn process_and_save_repo(
 
         sqlx::query(
             r#"
-            INSERT INTO issues (url, repo_id, title, difficulty_score, labels, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO issues (url, repo_id, title, difficulty_score, labels, created_at, state)
+            VALUES ($1, $2, $3, $4, $5, $6, 'open')
             ON CONFLICT (url) DO UPDATE 
-            SET title = EXCLUDED.title, difficulty_score = EXCLUDED.difficulty_score, labels = EXCLUDED.labels
+            SET title = EXCLUDED.title, difficulty_score = EXCLUDED.difficulty_score, labels = EXCLUDED.labels, state = 'open'
             "#
         )
         .bind(url)
@@ -510,4 +543,100 @@ async fn process_and_save_repo(
     tx.commit().await?;
 
     Ok(true)
+}
+
+// ================= SYNC TASK LOGIC =================
+
+async fn sync_open_issues(pool: &PgPool, client: &reqwest::Client, token: &str) -> Result<()> {
+    println!("🔄 [Sync Task] Fetching 'open' issues from Supabase...");
+    
+    let db_issues: Vec<DbIssueRow> = sqlx::query_as(
+        "SELECT url, repo_id FROM issues WHERE state = 'open'"
+    )
+    .fetch_all(pool)
+    .await?;
+
+    // Group them by repository to save API calls
+    let mut repos_dict: HashMap<String, HashMap<i64, String>> = HashMap::new();
+    for row in db_issues {
+        // Extract issue number from end of URL. e.g. https://github.com/rust-lang/rust/issues/1234
+        if let Some(num_str) = row.url.trim_end_matches('/').split('/').last() {
+            if let Ok(num) = num_str.parse::<i64>() {
+                repos_dict.entry(row.repo_id).or_default().insert(num, row.url);
+            }
+        }
+    }
+
+    println!("📊 [Sync Task] Found {} open issues across {} repositories.", repos_dict.values().map(|v| v.len()).sum::<usize>(), repos_dict.len());
+    let mut total_closed = 0;
+
+    for (repo, db_issues_map) in repos_dict {
+        let mut github_open_numbers = HashSet::new();
+        let mut page = 1;
+
+        loop {
+            let gh_url = format!("https://api.github.com/repos/{}/issues?state=open&per_page=100&page={}", repo, page);
+            
+            let res = client.get(&gh_url)
+                .header(USER_AGENT, "rust-github-scraper")
+                .header(AUTHORIZATION, format!("Bearer {}", token))
+                .send()
+                .await;
+
+            match res {
+                Ok(response) if response.status().is_success() => {
+                    let gh_data: Vec<GithubIssue> = match response.json().await {
+                        Ok(data) => data,
+                        Err(e) => {
+                            println!("⚠️ [Sync Task] Failed to parse JSON for {}: {}", repo, e);
+                            break;
+                        }
+                    };
+                    
+                    if gh_data.is_empty() {
+                        break;
+                    }
+                    
+                    for gh_issue in gh_data {
+                        if gh_issue.pull_request.is_none() {
+                            github_open_numbers.insert(gh_issue.number);
+                        }
+                    }
+                    page += 1;
+                }
+                Ok(response) => {
+                    println!("⚠️ [Sync Task] Error or Repo missing: {} ({})", repo, response.status());
+                    break;
+                }
+                Err(e) => {
+                    println!("⚠️ [Sync Task] API Request failed for {}: {}", repo, e);
+                    break;
+                }
+            }
+        }
+
+        let db_open_numbers: HashSet<i64> = db_issues_map.keys().cloned().collect();
+        let closed_or_deleted_numbers: Vec<i64> = db_open_numbers.difference(&github_open_numbers).cloned().collect();
+
+        if !closed_or_deleted_numbers.is_empty() {
+            let urls_to_close: Vec<String> = closed_or_deleted_numbers.iter()
+                .filter_map(|n| db_issues_map.get(n).cloned())
+                .collect();
+                
+            println!("🧹 [Sync Task] Found {} closed/deleted issues in {}! Updating DB...", urls_to_close.len(), repo);
+            
+            sqlx::query("UPDATE issues SET state = 'closed' WHERE url = ANY($1)")
+                .bind(&urls_to_close)
+                .execute(pool)
+                .await?;
+                
+            total_closed += urls_to_close.len();
+        }
+        
+        sleep(Duration::from_millis(500)).await; // polite delay between repos
+    }
+
+    println!("✅ [Sync Task] Cleanup Complete! Successfully closed {} outdated issues.", total_closed);
+    
+    Ok(())
 }
