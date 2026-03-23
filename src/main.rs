@@ -147,7 +147,7 @@ async fn main() -> Result<()> {
 // ================= DATABASE CLEANUP LOGIC =================
 
 async fn cleanup_database(pool: &PgPool) -> Result<()> {
-    println!("\n🧹 Enforcing database limits...");
+    println!("\n🧹 Cleaning up old data (older than 1 month)...");
 
     // PRODUCTION OPTIMIZATION: Use Transactions for safe, atomic deletions
     let mut tx = pool.begin().await?;
@@ -155,22 +155,17 @@ async fn cleanup_database(pool: &PgPool) -> Result<()> {
     let issues_deleted = sqlx::query(
         r#"
         DELETE FROM issues 
-        WHERE url IN (
-            SELECT url FROM issues 
-            ORDER BY created_at DESC 
-            OFFSET 2000
-        )
+        WHERE created_at < NOW() - INTERVAL '1 month'
         "#
     )
     .execute(&mut *tx)
     .await?;
-    println!("   🗑️ Pruned {} old issues (Max 2000 limit).", issues_deleted.rows_affected());
+    println!("   🗑️ Pruned {} old issues (Older than 1 month).", issues_deleted.rows_affected());
 
     let repos_to_delete: Vec<(String,)> = sqlx::query_as(
         r#"
         SELECT full_name FROM repos 
-        ORDER BY last_active DESC 
-        OFFSET 200
+        WHERE last_active < NOW() - INTERVAL '1 month'
         "#
     )
     .fetch_all(&mut *tx)
@@ -197,7 +192,7 @@ async fn cleanup_database(pool: &PgPool) -> Result<()> {
     // Commit the transaction - if anything failed above, NO data is deleted
     tx.commit().await?;
     
-    println!("   🗑️ Pruned {} old repos (Max 200 limit).", repos_deleted_count);
+    println!("   🗑️ Pruned {} old repos (Older than 1 month).", repos_deleted_count);
     
     Ok(())
 }
